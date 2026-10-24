@@ -78,6 +78,126 @@ def find_kobo_db(explicit=None, kobo_root=None):
   )
 
 
+def is_shelf_deleted(row):
+  if row is None:
+    return True
+  try:
+    v = row["_IsDeleted"]
+  except Exception:
+    try:
+      v = row[5]
+    except Exception:
+      return False
+  if isinstance(v, bool):
+    return v
+  if isinstance(v, int):
+    return v != 0
+  if isinstance(v, str):
+    s = v.strip().lower()
+    if s in ("true", "1", "yes"):
+      return True
+    if s in ("false", "0", "no", ""):
+      return False
+    return False
+  return False
+
+
+def is_shelf_content_deleted(row):
+  if row is None:
+    return True
+  try:
+    v = row["_IsDeleted"]
+  except Exception:
+    return True
+  if isinstance(v, bool):
+    return v
+  if isinstance(v, int):
+    return v != 0
+  if isinstance(v, str):
+    s = v.strip().lower()
+    if s in ("true", "1", "yes"):
+      return True
+    if s in ("false", "0", "no", ""):
+      return False
+    return False
+  return True
+
+
+def get_non_deleted_shelves(cur):
+  cur.execute("SELECT Name, Id, _IsDeleted FROM Shelf")
+  rows = cur.fetchall()
+  result = []
+  for s in rows:
+    if is_shelf_deleted(s):
+      continue
+    result.append(s)
+  return result
+
+
+def shelf_exists(cur, name):
+  cur.execute(
+    """
+    SELECT 1 FROM Shelf
+    WHERE Name = ? AND
+          (_IsDeleted IS NULL OR _IsDeleted IN (0,'0','false'))
+    """,
+    (name,),
+  )
+  return cur.fetchone() is not None
+
+
+def create_shelf(cur, name, now):
+  cur.execute(
+    """
+    INSERT INTO Shelf (CreationDate, Id, InternalName, LastModified, Name, Type, _IsDeleted,
+                       _IsVisible, _IsSynced)
+    VALUES (?, ?, ?, ?, ?, '', 'false', 'true', 'false')
+    """,
+    (now, name, name, now, name),
+  )
+
+
+def delete_shelf_soft(cur, name, now):
+  cur.execute(
+    """
+    UPDATE Shelf SET _IsDeleted = 'true', LastModified = ?, _IsSynced = 'false'
+    WHERE Name = ?
+    """,
+    (now, name),
+  )
+  cur.execute(
+    """
+    UPDATE ShelfContent SET _IsDeleted = 'true', DateModified = ?, _IsSynced = 'false'
+    WHERE ShelfName = ?
+    """,
+    (now, name),
+  )
+
+
+def membership_exists(cur, shelf_name, cid):
+  cur.execute(
+    """
+    SELECT 1 FROM ShelfContent
+    WHERE ShelfName = ? AND ContentId = ? AND
+          (_IsDeleted IS NULL OR _IsDeleted IN (0,'0','false'))
+    """,
+    (shelf_name, cid),
+  )
+  return cur.fetchone() is not None
+
+
+def add_to_shelf(cur, shelf_name, cid, now):
+  cur.execute(
+    """
+    INSERT OR REPLACE INTO ShelfContent
+      (ShelfName, ContentId, DateModified, _IsDeleted, _IsSynced)
+    VALUES (?, ?, ?, 'false', 'false')
+    """,
+    (shelf_name, cid, now),
+  )
+  cur.execute("UPDATE Shelf SET LastModified = ? WHERE Name = ?", (now, shelf_name))
+
+
 def get_mount_root(db_path):
   p = Path(db_path).resolve()
   if p.name == DB_NAME and p.parent.name == KOBO_DIR:
@@ -213,6 +333,7 @@ def cmd_collections_list(args):
       """,
       (filter_name,),
     )
+    shelves = cur.fetchall()
   else:
     cur.execute(
       """
@@ -221,10 +342,12 @@ def cmd_collections_list(args):
       ORDER BY Name
       """
     )
-  shelves = cur.fetchall()
+    shelves = cur.fetchall()
   for s in shelves:
-    deleted = s["_IsDeleted"] in (1, "1", "true", True)
-    if deleted:
+    deleted = is_shelf_deleted(s)
+    if deleted and filter_name is None:
+      continue
+    if filter_name and deleted:
       continue
     cur.execute(
       """
@@ -274,6 +397,94 @@ def cmd_collections_list(args):
   return 0
 
 
+def plan_tags_to_collections(db_path, mount_root, books, ignore):
+  wanted_tags = set()
+  for b in books:
+    for t in (b.get("tags") or []):
+      if t and t not in ignore:
+        wanted_tags.add(t)
+  conn = sqlite3.connect(str(db_path))
+  conn.row_factory = sqlite3.Row
+  cur = conn.cursor()
+  shelves = get_non_deleted_shelves(cur)
+  to_delete = []
+  for s in shelves:
+    name = s["Name"]
+    if name not in wanted_tags:
+      to_delete.append(name)
+  to_create = set()
+  to_add = []
+  seen_add = set()
+  for b in books:
+    tags = [t for t in (b.get("tags") or []) if t and t not in ignore]
+    if not tags:
+      continue
+    lpath = b.get("lpath")
+    local = find_file_on_mount(mount_root, lpath)
+    if not local:
+      continue
+    cid = file_to_content_id(local, mount_root)
+    if not cid:
+      continue
+    for tag in tags:
+      if not shelf_exists(cur, tag):
+        to_create.add(tag)
+      if not membership_exists(cur, tag, cid):
+        key = (tag, cid)
+        if key not in seen_add:
+          to_add.append(key)
+          seen_add.add(key)
+  conn.close()
+  return {
+    "wanted_tags": wanted_tags,
+    "to_delete": sorted(set(to_delete)),
+    "to_create": sorted(list(to_create)),
+    "to_add": to_add,
+    "has_destructive": len(to_delete) > 0,
+  }
+
+
+def apply_tags_to_collections(plan, db_path, dry_run_flag, force):
+  if dry_run_flag:
+    for name in plan["to_delete"]:
+      print(f"Would remove collection: {name}")
+    for tag in plan["to_create"]:
+      print(f"Would create collection: {tag}")
+    for tag, cid in plan["to_add"]:
+      print(f"Would add {cid} to {tag}")
+    print("Dry run complete")
+    return 0
+  if plan["has_destructive"] and not force:
+    print("Destructive changes detected:")
+    for name in plan["to_delete"]:
+      print(f"  Would remove collection: {name}")
+    print("Use --yes to apply destructive changes")
+    return 1
+  backup = str(db_path) + ".bak"
+  shutil.copy2(db_path, backup)
+  print(f"Backed up to {backup}")
+  conn = sqlite3.connect(str(db_path))
+  conn.row_factory = sqlite3.Row
+  cur = conn.cursor()
+  now = now_kobo()
+  for name in plan["to_delete"]:
+    delete_shelf_soft(cur, name, now)
+    print(f"Removed collection: {name}")
+  for tag in plan["to_create"]:
+    create_shelf(cur, tag, now)
+    print(f"Created collection: {tag}")
+  count_added = 0
+  for tag, cid in plan["to_add"]:
+    if not membership_exists(cur, tag, cid):
+      add_to_shelf(cur, tag, cid, now)
+      print(f"Added {cid} to {tag}")
+      count_added += 1
+  conn.commit()
+  conn.close()
+  print(f"Done. Added {count_added} memberships")
+  return 0
+
+
 def cmd_tags_to_collections(args):
   db_path = args.db_path
   mount_root = get_mount_root(db_path)
@@ -305,153 +516,10 @@ def cmd_tags_to_collections(args):
       t = t.strip()
       if t:
         ignore.add(t)
-  wanted_tags = set()
-  for b in books:
-    tags = b.get("tags") or []
-    for t in tags:
-      if t and t not in ignore:
-        wanted_tags.add(t)
   dry_run_flag = getattr(args, "dry_run", False)
   force = getattr(args, "yes", False)
-  conn = sqlite3.connect(str(db_path))
-  conn.row_factory = sqlite3.Row
-  cur = conn.cursor()
-  cur.execute("SELECT Name, Id, _IsDeleted FROM Shelf")
-  shelves = cur.fetchall()
-  to_delete = []
-  for s in shelves:
-    deleted = s["_IsDeleted"] in (1, "1", "true", True)
-    if deleted:
-      continue
-    name = s["Name"]
-    if name not in wanted_tags:
-      to_delete.append(name)
-  has_destructive = len(to_delete) > 0
-  if dry_run_flag:
-    for name in to_delete:
-      print(f"Would remove collection: {name}")
-    now = now_kobo()
-    for b in books:
-      tags = b.get("tags") or []
-      tags = [t for t in tags if t and t not in ignore]
-      if not tags:
-        continue
-      lpath = b.get("lpath")
-      local = find_file_on_mount(mount_root, lpath)
-      if not local:
-        continue
-      cid = file_to_content_id(local, mount_root)
-      if not cid:
-        continue
-      for tag in tags:
-        cur.execute(
-          """
-          SELECT 1 FROM Shelf
-          WHERE Name = ? AND
-                (_IsDeleted IS NULL OR _IsDeleted IN (0,'0','false'))
-          """,
-          (tag,),
-        )
-        if not cur.fetchone():
-          print(f"Would create collection: {tag}")
-        cur.execute(
-          """
-          SELECT 1 FROM ShelfContent
-          WHERE ShelfName = ? AND ContentId = ? AND
-                (_IsDeleted IS NULL OR _IsDeleted IN (0,'0','false'))
-          """,
-          (tag, cid),
-        )
-        if cur.fetchone():
-          continue
-        print(f"Would add {cid} to {tag}")
-    print("Dry run complete")
-    conn.close()
-    return 0
-  if has_destructive and not force:
-    print("Destructive changes detected:")
-    for name in to_delete:
-      print(f"  Would remove collection: {name}")
-    print("Use --yes to apply destructive changes")
-    conn.close()
-    return 1
-  backup = str(db_path) + ".bak"
-  shutil.copy2(db_path, backup)
-  print(f"Backed up to {backup}")
-  now = now_kobo()
-  count_added = 0
-  for name in to_delete:
-    cur.execute(
-      """
-      UPDATE Shelf SET _IsDeleted = 'true', LastModified = ?, _IsSynced = 'false'
-      WHERE Name = ?
-      """,
-      (now, name),
-    )
-    cur.execute(
-      """
-      UPDATE ShelfContent SET _IsDeleted = 'true', DateModified = ?, _IsSynced = 'false'
-      WHERE ShelfName = ?
-      """,
-      (now, name),
-    )
-    print(f"Removed collection: {name}")
-  for b in books:
-    tags = b.get("tags") or []
-    tags = [t for t in tags if t and t not in ignore]
-    if not tags:
-      continue
-    lpath = b.get("lpath")
-    local = find_file_on_mount(mount_root, lpath)
-    if not local:
-      continue
-    cid = file_to_content_id(local, mount_root)
-    if not cid:
-      continue
-    for tag in tags:
-      cur.execute(
-        """
-        SELECT 1 FROM Shelf
-        WHERE Name = ? AND
-              (_IsDeleted IS NULL OR _IsDeleted IN (0,'0','false'))
-        """,
-        (tag,),
-      )
-      if not cur.fetchone():
-        cur.execute(
-          """
-          INSERT INTO Shelf (CreationDate, Id, InternalName, LastModified, Name, Type, _IsDeleted,
-                             _IsVisible, _IsSynced)
-          VALUES (?, ?, ?, ?, ?, '', 'false', 'true', 'false')
-          """,
-          (now, tag, tag, now, tag),
-        )
-        print(f"Created collection: {tag}")
-      cur.execute(
-        """
-        SELECT 1 FROM ShelfContent
-        WHERE ShelfName = ? AND ContentId = ? AND
-              (_IsDeleted IS NULL OR _IsDeleted IN (0,'0','false'))
-        """,
-        (tag, cid),
-      )
-      if cur.fetchone():
-        continue
-      cur.execute(
-        """
-        INSERT OR REPLACE INTO ShelfContent
-          (ShelfName, ContentId, DateModified, _IsDeleted, _IsSynced)
-        VALUES (?, ?, ?, 'false', 'false')
-        """,
-        (tag, cid, now),
-      )
-      cur.execute("UPDATE Shelf SET LastModified = ? WHERE Name = ?", (now, tag))
-      count_added += 1
-      print(f"Added {cid} to {tag}")
-  conn.commit()
-  conn.close()
-  print(f"Done. Added {count_added} memberships")
-  return 0
+  plan = plan_tags_to_collections(db_path, mount_root, books, ignore)
+  return apply_tags_to_collections(plan, db_path, dry_run_flag, force)
 
 
 def build_parser():
