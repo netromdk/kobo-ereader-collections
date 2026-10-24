@@ -73,9 +73,8 @@ def find_kobo_db(explicit=None, kobo_root=None):
       pass
 
   raise SystemExit(
-    f"Could not find {DB_NAME} starting from {start}. "
-    f"Checked current/parents and immediate children. "
-    f"Use --db PATH or set {ENV_VAR}."
+    f"Could not find {DB_NAME} starting from {start}.\n"
+    f"Use `--db PATH` or set {ENV_VAR}."
   )
 
 
@@ -288,7 +287,15 @@ def cmd_tags_to_collections(args):
     meta_path = find_metadata_calibre(mount_root)
   if not meta_path:
     print(f"{CALIBRE_METADATA} not found")
-    print(f"Searched in {set([str(calibre_root), str(mount_root)])}")
+    searched = []
+    p1 = Path(calibre_root) / CALIBRE_METADATA
+    if not p1.is_file():
+      searched.append(str(calibre_root))
+    p2 = Path(mount_root) / CALIBRE_METADATA
+    if not p2.is_file() and str(mount_root) not in searched:
+      searched.append(str(mount_root))
+    if searched:
+      print(f"Searched in {', '.join(searched)}")
     return 1
   print(f"Using {CALIBRE_METADATA}: {meta_path}")
   books = load_metadata_calibre(meta_path)
@@ -298,18 +305,97 @@ def cmd_tags_to_collections(args):
       t = t.strip()
       if t:
         ignore.add(t)
-  dry_run = not getattr(args, "yes", False)
-  if dry_run:
-    print("Dry run (use --yes to apply)")
-  else:
-    backup = str(db_path) + ".bak"
-    shutil.copy2(db_path, backup)
-    print(f"Backed up to {backup}")
+  wanted_tags = set()
+  for b in books:
+    tags = b.get("tags") or []
+    for t in tags:
+      if t and t not in ignore:
+        wanted_tags.add(t)
+  dry_run_flag = getattr(args, "dry_run", False)
+  force = getattr(args, "yes", False)
   conn = sqlite3.connect(str(db_path))
   conn.row_factory = sqlite3.Row
   cur = conn.cursor()
+  cur.execute("SELECT Name, Id, _IsDeleted FROM Shelf")
+  shelves = cur.fetchall()
+  to_delete = []
+  for s in shelves:
+    deleted = s["_IsDeleted"] in (1, "1", "true", True)
+    if deleted:
+      continue
+    name = s["Name"]
+    if name not in wanted_tags:
+      to_delete.append(name)
+  has_destructive = len(to_delete) > 0
+  if dry_run_flag:
+    for name in to_delete:
+      print(f"Would remove collection: {name}")
+    now = now_kobo()
+    for b in books:
+      tags = b.get("tags") or []
+      tags = [t for t in tags if t and t not in ignore]
+      if not tags:
+        continue
+      lpath = b.get("lpath")
+      local = find_file_on_mount(mount_root, lpath)
+      if not local:
+        continue
+      cid = file_to_content_id(local, mount_root)
+      if not cid:
+        continue
+      for tag in tags:
+        cur.execute(
+          """
+          SELECT 1 FROM Shelf
+          WHERE Name = ? AND
+                (_IsDeleted IS NULL OR _IsDeleted IN (0,'0','false'))
+          """,
+          (tag,),
+        )
+        if not cur.fetchone():
+          print(f"Would create collection: {tag}")
+        cur.execute(
+          """
+          SELECT 1 FROM ShelfContent
+          WHERE ShelfName = ? AND ContentId = ? AND
+                (_IsDeleted IS NULL OR _IsDeleted IN (0,'0','false'))
+          """,
+          (tag, cid),
+        )
+        if cur.fetchone():
+          continue
+        print(f"Would add {cid} to {tag}")
+    print("Dry run complete")
+    conn.close()
+    return 0
+  if has_destructive and not force:
+    print("Destructive changes detected:")
+    for name in to_delete:
+      print(f"  Would remove collection: {name}")
+    print("Use --yes to apply destructive changes")
+    conn.close()
+    return 1
+  backup = str(db_path) + ".bak"
+  shutil.copy2(db_path, backup)
+  print(f"Backed up to {backup}")
   now = now_kobo()
   count_added = 0
+  for name in to_delete:
+    cur.execute(
+      """
+      UPDATE Shelf SET _IsDeleted = 'true', LastModified = ?, _IsSynced = 'false'
+      WHERE Name = ?
+      """,
+      (now, name),
+    )
+    cur.execute(
+      """
+      UPDATE ShelfContent SET _IsDeleted = 'true', DateModified = ?, _IsSynced = 'false'
+      WHERE ShelfName = ?
+      """,
+      (now, name),
+    )
+    print(f"Removed collection: {name}")
   for b in books:
     tags = b.get("tags") or []
     tags = [t for t in tags if t and t not in ignore]
@@ -332,18 +418,15 @@ def cmd_tags_to_collections(args):
         (tag,),
       )
       if not cur.fetchone():
-        if dry_run:
-          print(f"Would create collection: {tag}")
-        else:
-          cur.execute(
-            """
-            INSERT INTO Shelf (CreationDate, Id, InternalName, LastModified, Name, Type, _IsDeleted,
-                               _IsVisible, _IsSynced)
-            VALUES (?, ?, ?, ?, ?, '', 'false', 'true', 'false')
-            """,
-            (now, tag, tag, now, tag),
-          )
-          print(f"Created collection: {tag}")
+        cur.execute(
+          """
+          INSERT INTO Shelf (CreationDate, Id, InternalName, LastModified, Name, Type, _IsDeleted,
+                             _IsVisible, _IsSynced)
+          VALUES (?, ?, ?, ?, ?, '', 'false', 'true', 'false')
+          """,
+          (now, tag, tag, now, tag),
+        )
+        print(f"Created collection: {tag}")
       cur.execute(
         """
         SELECT 1 FROM ShelfContent
@@ -354,27 +437,20 @@ def cmd_tags_to_collections(args):
       )
       if cur.fetchone():
         continue
-      if dry_run:
-        print(f"Would add {cid} to {tag}")
-      else:
-        cur.execute(
-          """
-          INSERT OR REPLACE INTO ShelfContent
-            (ShelfName, ContentId, DateModified, _IsDeleted, _IsSynced)
-          VALUES (?, ?, ?, 'false', 'false')
-          """,
-          (tag, cid, now),
-        )
-        cur.execute("UPDATE Shelf SET LastModified = ? WHERE Name = ?", (now, tag))
-        count_added += 1
-        print(f"Added {cid} to {tag}")
-  if not dry_run:
-    conn.commit()
+      cur.execute(
+        """
+        INSERT OR REPLACE INTO ShelfContent
+          (ShelfName, ContentId, DateModified, _IsDeleted, _IsSynced)
+        VALUES (?, ?, ?, 'false', 'false')
+        """,
+        (tag, cid, now),
+      )
+      cur.execute("UPDATE Shelf SET LastModified = ? WHERE Name = ?", (now, tag))
+      count_added += 1
+      print(f"Added {cid} to {tag}")
+  conn.commit()
   conn.close()
-  if dry_run:
-    print("Dry run complete")
-  else:
-    print(f"Done. Added {count_added} memberships")
+  print(f"Done. Added {count_added} memberships")
   return 0
 
 
