@@ -454,6 +454,12 @@ def apply_tags_to_collections(plan, db_path, dry_run_flag, force):
       print(f"Would add {cid} to {tag}")
     print("Dry run complete")
     return 0
+  has_changes = (len(plan["to_delete"]) > 0 or
+                 len(plan["to_create"]) > 0 or
+                 len(plan["to_add"]) > 0)
+  if not has_changes:
+    print("No changes needed")
+    return 0
   if plan["has_destructive"] and not force:
     print("Destructive changes detected:")
     for name in plan["to_delete"]:
