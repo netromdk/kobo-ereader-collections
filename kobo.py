@@ -466,7 +466,8 @@ def apply_tags_to_collections(plan, db_path, dry_run_flag, force):
       print(f"  Would remove collection: {name}")
     print("Use --yes to apply destructive changes")
     return 1
-  backup = str(db_path) + ".bak"
+  ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+  backup = f"{db_path}.{ts}.bak"
   shutil.copy2(db_path, backup)
   print(f"Backed up to {backup}")
   conn = sqlite3.connect(str(db_path))
